@@ -1,0 +1,5 @@
+name: codebuddy-provider
+kind: model-provider
+version: 1.0.0
+description: Tencent CodeBuddy Code (via cli2api gateway) - GLM/DeepSeek/Kimi/Hunyuan
+author: local

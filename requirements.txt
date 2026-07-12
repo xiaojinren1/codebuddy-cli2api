@@ -1,0 +1,9 @@
+# CodeBuddy gateway has NO third-party dependencies - it uses only the Python
+# 3.11+ standard library (http.server, urllib, json, hashlib, threading, ...).
+#
+# To run the gateway you only need Python 3.11+:
+#     python3 -m codebuddy_gateway
+#
+# (Hermes Agent itself depends on httpx/openai-sdk, but the gateway does not.)
+
+# No pins needed. Keep this file empty as a marker that deps are already satisfied.
