@@ -333,6 +333,64 @@ All config is via environment variables (see `.env.example`).
 | `CODEBUDDY_TIMEOUT` | `180` | Upstream request timeout (seconds). |
 | `IMAGE_FETCH_MAX_BYTES` | `20971520` | Cap when inlining a remote image. |
 | `GATEWAY_LOG_LEVEL` | `INFO` | Logging level. |
+| `CODEBUDDY_RESOURCE_BASE_URL` | `https://copilot.tencent.com` | Upstream for OAuth resource endpoints (see below). |
+| `CODEBUDDY_AUTH_FILE` | auto | WorkBuddy/CodeBuddy session file for OAuth resources. |
+| `CODEBUDDY_REMOTE` | — | `1` binds `0.0.0.0`; requires `GATEWAY_API_KEY`. |
+| `CODEBUDDY_AUTO_CHECKIN` | `1` | Auto-claim the daily check-in credit once per UTC day. |
+
+---
+
+## 🎫 WorkBuddy 资源端点（OAuth）与远程部署
+
+除 chat 外，网关还透传 WorkBuddy/CodeBuddy 的免费/付费资源端点。这些端点强制
+`Bearer <OAuth accessToken>`（`ck_` key 无效），网关自己持有 OAuth session（默认读
+桌面 WorkBuddy 的 `workbuddy-desktop.info` 或 CLI 的 `~/.codebuddy/auth/*.info`，自动
+刷新），客户端只需 `GATEWAY_API_KEY`，永远接触不到 token。chat 路径不变，仍走
+`ck_` key（无有效 key 时自动回落到 OAuth session）。
+
+| 网关路径 | 上游 | 说明 |
+|---|---|---|
+| `POST /v1/checkin` | `/v2/billing/meter/daily-checkin` | 每日签到（空 body） |
+| `POST /v1/checkin-status` | `/billing/meter/checkin-status` | 当日签到状态 |
+| `POST /v1/checkin-activity` | `/v2/billing/meter/checkin-activity-status` | 活动状态 |
+| `POST /v1/asr` | `/agenttool/v1/asr` | 录音转文字，multipart（字段 `audio`+`fileName`） |
+| `POST /v1/tts` | `/agenttool/v1/tts` | 语音合成，JSON `{text}`，SSE 流式返回 |
+| `POST /v1/tempkey` | `/agenttool/v1/tempkey` | 临时云凭证 |
+| `POST /v1/search` / `/v1/web_search` | `/agenttool/v1/search` | 联网搜索 |
+| `POST /v1/webfetch` | `/agenttool/v1/webfetch` | 抓取网页为 markdown |
+| `POST /v1/images/generations` | `/v2/images/generations` | 文生图（`/v1` 别名把 `data.data[]` 归一为 `data[]`） |
+| `POST /v1/images/edits` | `/v2/images/edits` | 图生图 |
+| `POST /v1/videos/generations` | `/v2/videos/generations` | 文生视频（返回 task id） |
+| `POST /v1/videos/tasks` | `/v2/videos/tasks` | 轮询视频任务 |
+
+上游原始路径（`/agenttool/v1/...`、`/v2/images/...` 等）也直接可用，行为一致。
+
+**域名勘误**：`www.codebuddy.ai` 会对 OAuth token 直接 401（边缘网关拒绝）；实测
+`https://copilot.tencent.com`（桌面 WorkBuddy 默认端点）与 `www.codebuddy.cn` 全端点
+可用，默认取前者，用 `CODEBUDDY_RESOURCE_BASE_URL` 覆盖。
+
+**自动签到**：网关启动后内置守护线程，每个 UTC 日自动领一次 `/v1/checkin`（每日
+100 积分），不依赖任何客户端（OMP 不开、端口不暴露也照常执行），失败每小时重试，
+`CODEBUDDY_AUTO_CHECKIN=0` 关闭。
+
+**远程部署（令牌跨机器，不暴露端口）**：默认网关只监听 `127.0.0.1`，其它机器用
+SSH 隧道访问（不用开 `CODEBUDDY_REMOTE`）：
+
+```bash
+# 持有 session 的机器（常开/云主机）
+GATEWAY_API_KEY=<随机串> python3 -m codebuddy_gateway
+# 其它机器：一条隧道，之后所有客户端都指 127.0.0.1:8787
+ssh -N -L 8787:127.0.0.1:8787 user@gateway-host
+curl http://127.0.0.1:8787/health -H "Authorization: Bearer <随机串>"
+```
+
+可选：确实需要直连时（如 Tailscale 网段内）再设 `CODEBUDDY_REMOTE=1` 绑定
+`0.0.0.0`，此时未设 `GATEWAY_API_KEY` 会拒绝启动。首次部署无 session 文件时运行
+`python3 -m codebuddy_gateway --login` 走浏览器外链登录。
+
+**OMP / oh-my-pi 集成**：`~/.omp/agent/extensions/workbuddy-tools.ts` 注册
+`workbuddy` provider（`--model workbuddy/hy3`）与 `codebuddy_checkin`/`codebuddy_asr`/
+`codebuddy_tts` 工具，并在每次 session 启动时自动签到一次。
 
 ---
 

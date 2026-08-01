@@ -9,6 +9,7 @@ format emitter.
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 import urllib.request
 from typing import Any, Iterator
@@ -28,6 +29,7 @@ def stream_codebuddy(
     api_key: str,
     *,
     base_url: str | None = None,
+    mode: str = "key",
 ) -> Iterator[dict[str, Any]]:
     """POST ``openai_body`` (forced ``stream:true``) to CodeBuddy, yield chunk dicts.
 
@@ -44,9 +46,32 @@ def stream_codebuddy(
     else:
         body["stream_options"] = {"include_usage": True}
 
+    # ── Reasoning / chain-of-thought injection ─────────────────────────────
+    # CodeBuddy only emits ``reasoning_content`` when the request carries a
+    # top-level ``reasoning_effort`` string ("low" | "high"). Most OpenAI-style
+    # clients (incl. Hermes' OpenAI transport, which gates reasoning on a
+    # host allowlist that excludes the local gateway) never send it, so the
+    # thinking chain silently disappears. Inject a default unless the client
+    # already asked for something or explicitly disabled reasoning.
+    # Env override: CODEBUDDY_REASONING_EFFORT (off|false|"" to disable).
+    _reasoning_off = {"off", "false", "none", "no", ""}
+    env_effort = os.environ.get("CODEBUDDY_REASONING_EFFORT", "high").strip().lower()
+    explicit_disable = (
+        body.get("enable_thinking") is False
+        or body.get("reasoning") is False
+        or body.get("reasoning_effort") in (False, 0, "off", "false", "none", "no", "")
+    )
+    if "reasoning_effort" not in body and not explicit_disable and env_effort not in _reasoning_off:
+        # Only valid upstream values are "low" and "high" (others return empty
+        # reasoning). Normalize common aliases defensively.
+        if env_effort in ("low", "high"):
+            body["reasoning_effort"] = env_effort
+        else:
+            body["reasoning_effort"] = "high"
+
     url = (base_url or DEFAULT_BASE_URL).rstrip("/") + DEFAULT_CHAT_PATH
     payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    headers = upstream_headers(api_key)
+    headers = upstream_headers(api_key, mode=mode)
 
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
     log.debug("-> CodeBuddy %s model=%s msgs=%d", url, body.get("model"), len(body.get("messages", [])))

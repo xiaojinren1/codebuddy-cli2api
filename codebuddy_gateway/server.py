@@ -7,6 +7,7 @@ connection errors, usage capture for cache-aware rotation, and SSE streaming.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import chain
@@ -23,8 +24,10 @@ from .common import (
     models_json,
 )
 from .formats import anthropic, codex, gemini, openai
+from .resources import forward_resource, resolve_resource
 from .rotation import KeyPool
 from .upstream import stream_codebuddy
+from .auth import SESSIONS
 
 # Methods on the pool that are retryable upstream statuses.
 _RETRYABLE = {401, 403, 408, 409, 429, 500, 502, 503, 504}
@@ -115,14 +118,18 @@ class _UsageTee:
 def _connect(openai_body: dict[str, Any], fmt_name: str):
     """Open the upstream stream, returning (first_chunk_or_None, rest_iter, key).
 
-    Retries on retryable upstream errors using a different key. Raises
-    UpstreamError if all keys fail or the error is non-retryable.
+    Retries on retryable upstream errors using a different key. When the pool
+    is empty or every key failed retryably (401/403/429/5xx), falls back to the
+    account's OAuth session (mode="oauth") so chat keeps working without a
+    valid ck_ key. Non-retryable request errors (400 etc.) are never retried
+    via OAuth - the request itself is bad.
     """
     attempts = max(1, _pool.size)
     last_err: UpstreamError | None = None
+    retryable_only = True
     for _ in range(attempts):
         if not _pool.has_keys():
-            raise GatewayError(500, "no CodeBuddy API keys configured (set CODEBUDDY_API_KEY)")
+            break
         key = _pool.pick(openai_body)
         try:
             gen = stream_codebuddy(openai_body, key)
@@ -132,9 +139,23 @@ def _connect(openai_body: dict[str, Any], fmt_name: str):
             _pool.mark_error(key, e.status)
             last_err = e
             if e.status not in _RETRYABLE:
-                raise
+                retryable_only = False
+                break
             log.info("upstream %d on key …%s, retrying another key", e.status, key[-6:])
             continue
+
+    if retryable_only:
+        try:
+            from .auth import SESSIONS
+            session = SESSIONS.get()
+            gen = stream_codebuddy(openai_body, session.access_token, mode="oauth")
+            first = next(gen, None)
+            log.info("chat via OAuth session (no usable ck_ key)")
+            return first, gen, "oauth"
+        except UpstreamError:
+            raise
+        except GatewayError as e:
+            raise last_err or e
     raise last_err or UpstreamError(502, "all keys exhausted")
 
 
@@ -219,7 +240,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         _, _, kind = route
         if kind == "health":
-            self._send_json(200, {"ok": True, "service": "codebuddy-gateway", "keys": _pool.size})
+            self._send_json(200, {
+                "ok": True,
+                "service": "codebuddy-gateway",
+                "keys": _pool.size,
+                "oauth": SESSIONS.available(),
+            })
         elif kind == "get-models":
             self._send_json(200, models_json())
         elif kind == "debug-keys":
@@ -236,6 +262,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         route = _route("POST", self.path)
         if route is None:
+            if self._handle_resource():
+                return
             self._send_error(404, f"not found: {self.path}", "openai")
             return
         fmt, stream_hint, kind = route
@@ -303,9 +331,89 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_error(502, f"gateway error: {e}", fmt_name)
 
 
+    # ── resource passthrough (OAuth session, never touches the ck_ pool) ──
+    def _handle_resource(self) -> bool:
+        """Serve a resource route; return False when the path is not a resource."""
+        if resolve_resource(self.path) is None:
+            return False
+        raw = self._read_body()
+        try:
+            result = forward_resource(self.path, "POST", dict(self.headers), raw)
+        except GatewayError as e:
+            self._send_error(e.status, e.message, "openai")
+            return True
+        status, payload, ctype, streaming = result
+        if streaming:
+            self._start_sse()
+            try:
+                for chunk in payload:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                log.info("client disconnected (resource sse)")
+            return True
+        self._send_json(status, payload, ctype)
+        return True
+
+
+# ── daily check-in loop ─────────────────────────────────────────────────────
+def _start_auto_checkin() -> threading.Thread | None:
+    """Claim the daily check-in credit once per UTC day, client-independent.
+
+    Runs inside the gateway (daemon thread), so the daily 100 credits are
+    claimed as long as the gateway process is up - no OMP session, no exposed
+    port, no cron needed. The endpoint is idempotent ("already checked in" is
+    a normal response), so restarts are harmless. Retries hourly on failure.
+    Disable with CODEBUDDY_AUTO_CHECKIN=0.
+    """
+    if os.environ.get("CODEBUDDY_AUTO_CHECKIN", "1").strip().lower() in ("0", "off", "false", "no"):
+        log.info("auto check-in disabled (CODEBUDDY_AUTO_CHECKIN=0)")
+        return None
+
+    def loop():
+        import time
+        claimed_day = ""
+        while True:
+            try:
+                today = time.strftime("%Y-%m-%d", time.gmtime())
+                if today != claimed_day:
+                    try:
+                        status, payload, _, _ = forward_resource("/v1/checkin", "POST", {}, b"{}")
+                        claimed_day = today  # any upstream answer is conclusive
+                        try:
+                            data = json.loads(payload.decode("utf-8"))
+                            code = data.get("code")
+                            msg = data.get("msg") or payload[:120]
+                        except Exception:
+                            code, msg = None, payload[:120]
+                        # code 0 = claimed; 10001 = already claimed today (also success)
+                        if status == 200 or code in (0, 10001):
+                            log.info("daily check-in (%s): HTTP %d code=%s %s", today, status, code, msg)
+                        else:
+                            log.warning("daily check-in (%s): HTTP %d code=%s %s", today, status, code, msg)
+                    except GatewayError as e:
+                        log.warning("daily check-in (%s) failed: %s - retrying in 1h", today, e.message)
+            except Exception:  # noqa: BLE001 - keep the loop alive
+                log.exception("auto check-in loop error")
+            time.sleep(3600)
+
+    t = threading.Thread(target=loop, name="daily-checkin", daemon=True)
+    t.start()
+    return t
+
+
 def serve(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
+    # Remote binding without a client secret is a footgun: every machine on
+    # the network could burn the owner's paid quota. Fail at startup.
+    _LOCAL_BINDS = {"127.0.0.1", "localhost", "::1", ""}
+    if host not in _LOCAL_BINDS and not GATEWAY_API_KEY:
+        raise RuntimeError(
+            f"refusing to bind {host!r} without GATEWAY_API_KEY: set GATEWAY_API_KEY "
+            "(shared with clients) or keep GATEWAY_HOST=127.0.0.1"
+        )
     if not _pool.has_keys():
         log.warning("starting with no API keys - set CODEBUDDY_API_KEY / CODEBUDDY_API_KEYS")
+    _start_auto_checkin()
     srv = ThreadingHTTPServer((host, port), Handler)
     srv.daemon_threads = True
     log.info("CodeBuddy gateway listening on http://%s:%d  (keys=%d, default model=hy3)", host, port, _pool.size)

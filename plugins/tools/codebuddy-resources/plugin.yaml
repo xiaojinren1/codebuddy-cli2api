@@ -1,0 +1,10 @@
+name: codebuddy-resources
+type: tool
+version: 1.0.0
+description: >-
+  CodeBuddy free resources (web search, image generation/editing, video
+  generation) exposed as Hermes tools. Backed by the codebuddy-gateway at
+  http://127.0.0.1:8787. The gateway performs the OAuth login and proxies the
+  CodeBuddy agenttool / images / videos endpoints.
+provides_tools: true
+entry: __init__.py

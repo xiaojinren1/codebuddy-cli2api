@@ -29,3 +29,6 @@ keys.txt
 
 # Test artifacts
 *.log
+
+# Local agent memory
+.workbuddy/
