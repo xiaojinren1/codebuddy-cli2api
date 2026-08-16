@@ -51,6 +51,33 @@ IMAGE_FETCH_MAX_BYTES = int(os.environ.get("IMAGE_FETCH_MAX_BYTES", str(20 * 102
 # Default model for the gateway / hermes plugin.
 DEFAULT_MODEL = os.environ.get("CODEBUDDY_DEFAULT_MODEL", "hy3")
 
+
+def _model_aliases() -> dict[str, str]:
+    """Resolve Codex display-name aliases to CodeBuddy model ids.
+
+    CC Switch normally rewrites these names, but requests can still arrive
+    with the display name when the selected model changes inside Codex.
+    """
+    aliases = {
+        "gpt-5.6-sol": "glm-5.3",
+        "gpt-5.6-luna": "kimi-k3-2",
+        "gpt-5.6-terra": "deepseek-v4-flash",
+    }
+    raw = os.environ.get("CODEBUDDY_MODEL_ALIASES", "").strip()
+    if raw:
+        for pair in raw.split(","):
+            key, sep, value = pair.partition("=")
+            if sep and key.strip() and value.strip():
+                aliases[key.strip()] = value.strip()
+    return aliases
+
+
+MODEL_ALIASES = _model_aliases()
+
+
+def resolve_model(model: str | None) -> str | None:
+    return MODEL_ALIASES.get(model, model) if model else model
+
 # ── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=os.environ.get("GATEWAY_LOG_LEVEL", "INFO"),
@@ -80,6 +107,8 @@ log = logging.getLogger("codebuddy.gateway")
 MODELS: list[dict[str, Any]] = [
     {"id": "hy3-preview-agent", "name": "Hy3 preview",            "img": True,  "max_out": 64000},
     {"id": "glm-5.1",           "name": "GLM-5.1",                 "img": False, "max_out": 48000},
+    {"id": "glm-5.3",           "name": "GLM-5.3",                 "img": False, "max_out": 48000, "reasoning": {"effort": "high"}},
+    {"id": "glm-5.2",           "name": "GLM-5.2",                 "img": False, "max_out": 48000, "reasoning": {"effort": "high"}},
     {"id": "glm-5.0",           "name": "GLM-5.0",                 "img": False, "max_out": 48000},
     {"id": "glm-5.0-turbo",     "name": "GLM-5.0-Turbo",           "img": False, "max_out": 48000},
     {"id": "glm-5v-turbo",      "name": "GLM-5v-Turbo",            "img": True,  "max_out": 38000},
@@ -91,6 +120,7 @@ MODELS: list[dict[str, Any]] = [
     {"id": "deepseek-v3-2-volc","name": "DeepSeek-V3.2",           "img": False, "max_out": 32000},
     {"id": "deepseek-v3.1",     "name": "DeepSeek-V3.1-Terminus",  "img": False, "max_out": 8192},
     {"id": "kimi-k2.6",         "name": "Kimi-K2.6",               "img": True,  "max_out": 32000},
+    {"id": "kimi-k3-2",         "name": "Kimi-K3-2",               "img": False, "max_out": 48000, "reasoning": True},
     {"id": "kimi-k2.5",         "name": "Kimi-K2.5",               "img": True,  "max_out": 32000},
     {"id": "minimax-m2.5",      "name": "MiniMax-M2.5",            "img": False, "max_out": 48000},
     {"id": "minimax-m2.7",      "name": "MiniMax-M2.7",            "img": True,  "max_out": 48000},
@@ -105,15 +135,82 @@ VISION_MODELS = {m["id"] for m in MODELS if m["img"]}
 
 
 def _norm_model(m: dict[str, Any]) -> dict[str, Any] | None:
-    mid = m.get("id")
+    if not isinstance(m, dict):
+        return None
+    mid = m.get("id") or m.get("slug") or m.get("model")
     if not mid:
         return None
-    return {
+    def first(*keys: str, default: Any = None) -> Any:
+        for key in keys:
+            value = m.get(key)
+            if value is not None and value != "":
+                return value
+        return default
+
+    name = first("name", "display_name", "displayName", "title", default=mid)
+    description = first("description", "description_en", "descriptionEn", default="")
+    description_zh = first("description_zh", "descriptionZh", "zh_description", default="")
+    max_in = first("max_input_tokens", "maxInputTokens", "max_input", "maxInput", default=0)
+    max_out = first("max_output_tokens", "maxOutputTokens", "max_out", "maxOut", default=32000)
+    context = first("context_window", "contextWindow", "max_context_window", "maxContextWindow", default=0)
+    try:
+        max_in, max_out, context = int(max_in or 0), int(max_out or 0), int(context or 0)
+    except (TypeError, ValueError):
+        max_in, max_out, context = 0, 32000, 0
+
+    vision = first("supports_vision", "supportsVision", "vision", "img", default=False)
+    tool_call = first("supports_tool_call", "supportsToolCall", "tool_call", "toolCall", "tools", default=None)
+    reasoning = first("reasoning", "supports_reasoning", "supportsReasoning", default=None)
+    only_reasoning = first("onlyReasoning", "only_reasoning", default=None)
+    out: dict[str, Any] = {
         "id": mid,
-        "name": m.get("name") or mid,
-        "img": bool(m.get("supportsImages") or m.get("img")),
-        "max_out": int(m.get("maxOutputTokens") or m.get("maxOut") or 0) or 32000,
+        "name": name,
+        "img": bool(first("supportsImages", default=False) or vision),
+        "max_out": max_out or 32000,
+        "max_output_tokens": max_out or 32000,
     }
+    if description:
+        out["description"] = str(description)
+    if description_zh:
+        out["description_zh"] = str(description_zh)
+    if max_in:
+        out["max_in"] = max_in
+        out["max_input_tokens"] = max_in
+    out["supports_vision"] = out["img"]
+    if context:
+        out["context_window"] = context
+        try:
+            out["max_context_window"] = int(first("max_context_window", "maxContextWindow", default=context) or context)
+        except (TypeError, ValueError):
+            out["max_context_window"] = context
+    if reasoning is not None:
+        out["reasoning"] = reasoning
+    if only_reasoning is not None:
+        out["onlyReasoning"] = bool(only_reasoning)
+    if tool_call is not None:
+        out["tool_call"] = tool_call
+        out["supports_tool_call"] = bool(tool_call)
+    for key in ("credits", "vendor"):
+        value = m.get(key)
+        if value is not None:
+            out[key] = value
+    # Preserve explicit reasoning metadata used by CodeBuddy's product config.
+    if isinstance(reasoning, dict):
+        levels = reasoning.get("supported_reasoning_levels") or reasoning.get("supported_levels")
+        effort = reasoning.get("effort") or reasoning.get("default_reasoning_level")
+        if levels is not None:
+            out["supported_reasoning_levels"] = list(levels) if isinstance(levels, (list, tuple)) else [levels]
+        if effort:
+            out["default_reasoning_level"] = effort
+    # Also accept Codex catalog-shaped input when CODEBUDDY_MODEL_CATALOG_JSON
+    # is used as an override.
+    top_levels = m.get("supported_reasoning_levels") or m.get("supported_reasoning_efforts")
+    if top_levels is not None:
+        out["supported_reasoning_levels"] = list(top_levels) if isinstance(top_levels, (list, tuple)) else [top_levels]
+    top_default = m.get("default_reasoning_level") or m.get("default_reasoning_effort")
+    if top_default:
+        out["default_reasoning_level"] = str(top_default).lower()
+    return out
 
 
 def _cli_product_models() -> list[dict[str, Any]] | None:
@@ -160,7 +257,8 @@ def _local_storage_models() -> list[dict[str, Any]] | None:
     candidates: list[tuple[float, list[dict[str, Any]]]] = []
     for f in glob.glob(os.path.join(ls, "entry_*.info")):
         try:
-            raw = open(f, encoding="utf-8").read()
+            with open(f, encoding="utf-8") as fh:
+                raw = fh.read()
             # Most entries are JSON-string-wrapped. Unwrap the surrounding
             # quotes first; only gzip+base64 blobs decode further.
             if raw.startswith('"'):
@@ -244,13 +342,132 @@ def model_supports_vision(model: str | None) -> bool:
 
 def models_json() -> dict[str, Any]:
     """OpenAI-compatible /v1/models response (live catalog)."""
+    data = []
+    for m in load_model_catalog():
+        capabilities = {k: v for k, v in m.items() if k not in {"id", "name"}}
+        data.append({
+            "id": m["id"], "object": "model", "created": 0, "owned_by": m.get("vendor", "codebuddy"),
+            "name": m.get("name", m["id"]), "description": m.get("description", ""),
+            "capabilities": capabilities,
+        })
     return {
         "object": "list",
-        "data": [
-            {"id": m["id"], "object": "model", "created": 0, "owned_by": "codebuddy"}
-            for m in load_model_catalog()
-        ],
+        "data": data,
     }
+
+
+_CODEX_REASONING_LEVELS = {
+    # Codex exposes Low/Medium/High/X-High. CodeBuddy's Medium/High/X-High
+    # choices are all represented upstream by its supported ``high`` value.
+    "deepseek-v4-pro": (["low", "medium", "high", "xhigh"], "high"),
+    "deepseek-v4-flash": (["low", "medium", "high", "xhigh"], "xhigh"),
+    "glm-5.3": (["low", "medium", "high", "xhigh"], "high"),
+    "glm-5.2": (["medium", "high", "xhigh"], "high"),
+}
+_CODEX_NO_REASONING_MENU = {"kimi-k3-2", "glm-5v-turbo"}
+
+
+def _reasoning_levels(m: dict[str, Any]) -> tuple[list[str], str | None]:
+    slug = str(m.get("_codex_source_id") or m.get("id", ""))
+    if slug in _CODEX_NO_REASONING_MENU:
+        return [], None
+    if slug in _CODEX_REASONING_LEVELS:
+        return _CODEX_REASONING_LEVELS[slug]
+    raw = m.get("supported_reasoning_levels")
+    if isinstance(raw, (list, tuple)) and raw:
+        levels = []
+        for item in raw:
+            token = item.get("effort") if isinstance(item, dict) else item
+            token = str(token).strip().lower().replace("-", "")
+            if token in {"low", "medium", "high", "xhigh", "max", "ultra"}:
+                levels.append(token)
+        if levels:
+            default = str(m.get("default_reasoning_level") or levels[-1]).lower()
+            return levels, default if default in levels else levels[-1]
+    reasoning = m.get("reasoning")
+    if not reasoning:
+        return [], None
+    default = m.get("default_reasoning_level")
+    if isinstance(reasoning, dict):
+        default = reasoning.get("effort") or reasoning.get("default_reasoning_level") or default
+    if not default:
+        return [], None
+    default = str(default or "high").lower()
+    if default not in {"low", "medium", "high", "xhigh", "max", "ultra"}:
+        default = "high"
+    return [default], default
+
+
+def model_catalog_json() -> dict[str, Any]:
+    """Codex ``codex debug models`` compatible catalog with explicit abilities."""
+    override = os.environ.get("CODEBUDDY_MODEL_CATALOG_JSON") or os.environ.get("CODEBUDDY_CODEX_MODEL_CATALOG_JSON")
+    catalog = load_model_catalog()
+    if override:
+        try:
+            if override.lstrip().startswith(("{", "[")):
+                raw = json.loads(override)
+            else:
+                with open(os.path.expanduser(override), encoding="utf-8") as fh:
+                    raw = json.load(fh)
+            items = raw.get("models") if isinstance(raw, dict) else raw
+            if isinstance(items, list):
+                parsed = [x for x in (_norm_model(x) for x in items if isinstance(x, dict)) if x]
+                if parsed:
+                    catalog = parsed
+        except (OSError, ValueError, TypeError) as exc:
+            log.warning("invalid model catalog override: %s", exc)
+    models = []
+    catalog_by_id = {m["id"]: m for m in catalog}
+    # Expose the Codex-facing aliases as first-class picker entries while
+    # retaining the underlying CodeBuddy IDs for direct selection.
+    aliases = {
+        "gpt-5.6-sol": ("glm-5.3", "GPT-5.6-Sol"),
+        "gpt-5.6-luna": ("kimi-k3-2", "GPT-5.6-Luna"),
+        "gpt-5.6-terra": ("deepseek-v4-flash", "GPT-5.6-Terra"),
+    }
+    for alias, target in MODEL_ALIASES.items():
+        existing = aliases.get(alias)
+        if existing is None or existing[0] != target:
+            aliases[alias] = (target, alias)
+    catalog_items = list(catalog)
+    for alias, (target, display) in aliases.items():
+        source = catalog_by_id.get(target)
+        if source and alias not in catalog_by_id:
+            copy = dict(source)
+            copy["id"] = alias
+            copy["name"] = display
+            copy["description"] = display
+            copy["_codex_source_id"] = target
+            catalog_items.insert(0, copy)
+    for m in catalog_items:
+        levels, default = _reasoning_levels(m)
+        try:
+            context = int(m.get("context_window") or m.get("max_context_window") or m.get("max_in") or 128000)
+            max_context = int(m.get("max_context_window") or context)
+            priority = int(m.get("priority", 0) or 0)
+        except (TypeError, ValueError):
+            context, max_context, priority = 0, 0, 0
+        level_objects = [{"effort": level, "description": {
+            "low": "Fast responses with lighter reasoning",
+            "medium": "Balances speed and reasoning depth for everyday tasks",
+            "high": "Greater reasoning depth for complex problems",
+            "xhigh": "Extra high reasoning depth for complex problems",
+        }.get(level, level)} for level in levels]
+        models.append({
+            "slug": m["id"], "display_name": m.get("name", m["id"]),
+            "description": m.get("description", ""), "default_reasoning_level": default,
+            "supported_reasoning_levels": level_objects, "shell_type": "shell_command",
+            "visibility": "list", "supported_in_api": True, "priority": priority,
+            "context_window": context, "max_context_window": max_context,
+            "effective_context_window_percent": 95, "input_modalities": ["text", "image"] if m.get("img") else ["text"],
+            "default_reasoning_summary": "auto" if levels else "none",
+            "base_instructions": "You are Codex, a coding assistant. Complete the user's task in the current turn.",
+            "supports_reasoning_summaries": bool(levels), "supports_parallel_tool_calls": bool(m.get("tool_call", True)),
+            "supports_search_tool": False, "support_verbosity": False,
+            "experimental_supported_tools": [], "service_tiers": [], "additional_speed_tiers": [],
+            "truncation_policy": {"mode": "bytes", "limit": 10000}, "upgrade": None,
+        })
+    return {"models": models}
 
 
 # ── Upstream routing headers (match CLI fingerprint) ────────────────────────

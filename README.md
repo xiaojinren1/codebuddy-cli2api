@@ -127,12 +127,38 @@ requirements.txt  .env.example  README.md  LICENSE
 git clone https://github.com/neipor/codebuddy-cli2api.git
 cd codebuddy-cli2api
 
-# 2. Set your CodeBuddy key (from the CodeBuddy CLI login)
-export CODEBUDDY_API_KEY=ck_yourkeyid.yoursecret
+# 2. Create the repository-root `.env` (loaded automatically at startup)
+cp .env.example .env
+# Edit `.env` and replace the placeholder with your CodeBuddy key.
 
 # 3. Run — no install step, stdlib only
 python3 -m codebuddy_gateway            # listens on http://127.0.0.1:8787
 python3 -m codebuddy_gateway --print-models   # print the model catalog
+python3 -m codebuddy_gateway --print-codex-models > ~/.codex/codebuddy-models.json  # Codex catalog
+
+# In ~/.codex/config.toml (machine-local Codex configuration):
+# model_catalog_json = "/Users/<you>/.codex/codebuddy-models.json"
+
+# Optional: register the read-only CodeBuddy consultation MCP server in
+# ~/.codex/config.toml. Native Codex keeps all filesystem and shell control.
+# [mcp_servers.codebuddy_consult]
+# command = "python3"
+# args = ["-m", "codebuddy_gateway.consult_mcp"]
+# cwd = "/Users/data/project/codebuddy-cli2api"
+# [mcp_servers.codebuddy_consult.env]
+# CODEBUDDY_GATEWAY_URL = "http://127.0.0.1:8787"
+# CODEBUDDY_CONSULT_MODEL = "glm-5.3"
+
+# Optional: use CodeBuddy models directly from Pi Coding Agent. The template
+# keeps Pi's native read/write/edit/bash tool loop and routes only model calls
+# through this gateway. Copy it after starting the gateway once:
+# mkdir -p ~/.pi/agent
+# cp pi-models.example.json ~/.pi/agent/models.json
+# If GATEWAY_API_KEY is enabled, replace the template's "apiKey": "local"
+# with that shared key (or use an environment-resolved value in models.json).
+# Then inspect/select models with:
+# pi --list-models
+# pi --provider codebuddy-local --model glm-5.3 --thinking high
 
 # 4. Smoke test (non-stream → the gateway aggregates for you)
 curl http://127.0.0.1:8787/v1/chat/completions \
@@ -184,6 +210,27 @@ curl -sS $GW/v1/responses -H 'Content-Type: application/json' \
 
 Tool calls, `reasoning_content`, and multi-turn conversations all work across
 every format.
+
+### Pi Coding Agent 直连
+
+Pi 0.84.2 可以通过 `~/.pi/agent/models.json` 添加 OpenAI-compatible provider。
+仓库中的 [`pi-models.example.json`](pi-models.example.json) 已配置
+`codebuddy-local`，指向 `http://127.0.0.1:8787/v1`，并包含 GLM、DeepSeek、Kimi
+示例模型。Pi 继续负责 `read`、`write`、`edit`、`bash` 工具循环，网关只负责把模型
+请求转发到 CodeBuddy。
+
+CodeBuddy 上游当前实际接受的推理参数只有 `low` 和 `high`，因此模板中的 Pi 档位映射为：
+
+| Pi thinking | CodeBuddy reasoning_effort |
+|---|---|
+| `minimal` / `low` | `low` |
+| `medium` / `high` / `xhigh` / `max` | `high` |
+| `off` | `none`（关闭网关默认注入） |
+
+`kimi-k3-2` 示例按当前 Codex 模型目录“不提供推理档位菜单”的结论按非推理使用，并固定
+发送 `reasoning_effort=none`，避免网关的默认推理注入。若你的 `/v1/models` 返回了不同的
+能力，以实际目录为准更新该模型条目。第三方模型的结构化 tool call 稳定性仍由模型本身
+决定，不能保证与原生 Codex 模型完全一致。
 
 ---
 
@@ -263,8 +310,10 @@ plugin — no Hermes core changes required.
 mkdir -p ~/.hermes/plugins/model-providers
 cp -r plugins/model-providers/codebuddy ~/.hermes/plugins/model-providers/
 
-# 2. Set the key (the gateway reads it; Hermes passes it through as Bearer)
-echo 'CODEBUDDY_API_KEY=ck_yourkeyid.yoursecret' >> ~/.hermes/.env
+# 2. Put the key in the repository-root `.env` (the gateway loads it; Hermes
+#    passes it through as Bearer)
+cp .env.example .env
+# Edit `.env` and replace the placeholder with your CodeBuddy key.
 
 # 3. Start the gateway
 python3 -m codebuddy_gateway &
@@ -317,7 +366,10 @@ key — the client never sees the failure.
 
 ## ⚙️ Configuration
 
-All config is via environment variables (see `.env.example`).
+All config is via environment variables (see `.env.example`). When started
+from the repository root, the gateway automatically loads `.env` and only uses
+its values for variables that are not already present in the process
+environment; explicit exports therefore take precedence.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -330,6 +382,10 @@ All config is via environment variables (see `.env.example`).
 | `GATEWAY_PORT` | `8787` | Gateway listen port. |
 | `GATEWAY_API_KEY` | — | Optional shared secret clients must present. |
 | `CODEBUDDY_DEFAULT_MODEL` | `hy3` | Model used when a request omits one. |
+| `CODEBUDDY_MODEL_ALIASES` | built-in Codex aliases | Comma-separated `display-name=model-id` overrides. |
+| `CODEBUDDY_CODEX_INSTRUCTIONS_MODE` | `compact` | Upstream Codex system prompt mode: `compact` avoids content filtering, `full` preserves the raw prompt for diagnostics, `drop` omits it. |
+| `CODEBUDDY_REASONING_EFFORT` | `high` | Default CodeBuddy reasoning effort when a client omits one: `low`, `high`, or `none`/`off`/`minimal` to disable. Invalid values fail with HTTP 400. |
+| `CODEBUDDY_MODEL_CATALOG_JSON` | — | Optional gateway-side catalog override (JSON or file path). Codex does not infer capabilities from `/v1/models`; generate a file with `--print-codex-models` and set Codex's `model_catalog_json` in `~/.codex/config.toml`. |
 | `CODEBUDDY_TIMEOUT` | `180` | Upstream request timeout (seconds). |
 | `IMAGE_FETCH_MAX_BYTES` | `20971520` | Cap when inlining a remote image. |
 | `GATEWAY_LOG_LEVEL` | `INFO` | Logging level. |

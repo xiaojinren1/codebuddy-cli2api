@@ -1,0 +1,79 @@
+{
+  "providers": {
+    "codebuddy-local": {
+      "baseUrl": "http://127.0.0.1:8787/v1",
+      "api": "openai-completions",
+      "apiKey": "ck_fv8lqnv4nj0g.X2X_RHlMQ2B4qXq4RJ3IqdXM2iyppqrBRg1DYc8h7_I",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": true
+      },
+      "models": [
+        {
+          "id": "glm-5.3",
+          "name": "GLM 5.3",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "low": "low",
+            "medium": "high",
+            "high": "high",
+            "xhigh": "high",
+            "max": "high"
+          }
+        },
+        {
+          "id": "glm-5.2",
+          "name": "GLM 5.2",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "low": "low",
+            "medium": "high",
+            "high": "high",
+            "xhigh": "high",
+            "max": "high"
+          }
+        },
+        {
+          "id": "deepseek-v4-pro",
+          "name": "DeepSeek V4 Pro",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "low": "low",
+            "medium": "high",
+            "high": "high",
+            "xhigh": "high",
+            "max": "high"
+          }
+        },
+        {
+          "id": "deepseek-v4-flash",
+          "name": "DeepSeek V4 Flash",
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "low": "low",
+            "medium": "high",
+            "high": "high",
+            "xhigh": "high",
+            "max": "high"
+          }
+        },
+        {
+          "id": "kimi-k3-2",
+          "name": "Kimi K3 2",
+          "reasoning": false,
+          "samplingParams": {
+            "reasoning_effort": "none"
+          }
+        }
+      ]
+    }
+  }
+}

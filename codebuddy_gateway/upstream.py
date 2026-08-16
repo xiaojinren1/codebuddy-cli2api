@@ -18,6 +18,7 @@ from .common import (
     DEFAULT_BASE_URL,
     DEFAULT_CHAT_PATH,
     UPSTREAM_TIMEOUT,
+    GatewayError,
     UpstreamError,
     log,
     upstream_headers,
@@ -54,20 +55,36 @@ def stream_codebuddy(
     # thinking chain silently disappears. Inject a default unless the client
     # already asked for something or explicitly disabled reasoning.
     # Env override: CODEBUDDY_REASONING_EFFORT (off|false|"" to disable).
-    _reasoning_off = {"off", "false", "none", "no", ""}
+    _reasoning_off = {"off", "false", "none", "no", "minimal", "0", ""}
     env_effort = os.environ.get("CODEBUDDY_REASONING_EFFORT", "high").strip().lower()
+    explicit_effort = body.get("reasoning_effort")
+    explicit_effort_disabled = False
+    if "reasoning_effort" in body and explicit_effort is None:
+        raise GatewayError(400, "reasoning_effort must be a string")
+    if explicit_effort is not None:
+        if isinstance(explicit_effort, bool):
+            explicit_effort = "high" if explicit_effort else "none"
+        elif not isinstance(explicit_effort, str):
+            raise GatewayError(400, "reasoning_effort must be a string")
+        else:
+            explicit_effort = explicit_effort.strip().lower()
+        if explicit_effort not in _reasoning_off | {"low", "high"}:
+            raise GatewayError(400, f"unsupported reasoning_effort: {body.get('reasoning_effort')}")
+        if explicit_effort in _reasoning_off:
+            explicit_effort_disabled = True
+            body.pop("reasoning_effort", None)
+        else:
+            body["reasoning_effort"] = explicit_effort
     explicit_disable = (
         body.get("enable_thinking") is False
         or body.get("reasoning") is False
         or body.get("reasoning_effort") in (False, 0, "off", "false", "none", "no", "")
+        or explicit_effort_disabled
     )
+    if env_effort not in _reasoning_off | {"low", "high"}:
+        raise GatewayError(400, f"unsupported CODEBUDDY_REASONING_EFFORT: {env_effort}")
     if "reasoning_effort" not in body and not explicit_disable and env_effort not in _reasoning_off:
-        # Only valid upstream values are "low" and "high" (others return empty
-        # reasoning). Normalize common aliases defensively.
-        if env_effort in ("low", "high"):
-            body["reasoning_effort"] = env_effort
-        else:
-            body["reasoning_effort"] = "high"
+        body["reasoning_effort"] = env_effort
 
     url = (base_url or DEFAULT_BASE_URL).rstrip("/") + DEFAULT_CHAT_PATH
     payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -142,6 +159,8 @@ def iter_events(chunks: Iterator[dict[str, Any]]) -> Iterator[tuple]:
     """Convert raw OpenAI chunks into canonical events."""
     saw_any = False
     meta_emitted = False
+    started_tools: set[int] = set()
+    tool_meta: dict[int, tuple[str, str]] = {}
     for chunk in chunks:
         saw_any = True
         if not meta_emitted:
@@ -155,19 +174,25 @@ def iter_events(chunks: Iterator[dict[str, Any]]) -> Iterator[tuple]:
             continue
         choice = choices[0]
         delta = choice.get("delta") or {}
-        if delta.get("content"):
-            yield ("text", delta["content"])
         rc = delta.get("reasoning_content")
         if rc:
             yield ("reasoning", rc)
+        if delta.get("content"):
+            yield ("text", delta["content"])
         for tc in delta.get("tool_calls") or []:
             idx = tc.get("index", 0)
             fn = tc.get("function") or {}
             tid = tc.get("id")
             name = fn.get("name")
-            if tid or name:
-                yield ("tool_start", idx, tid or "", name or "")
             args = fn.get("arguments")
+            previous = tool_meta.get(idx, ("", ""))
+            if idx not in started_tools and (tid or name or args is not None):
+                started_tools.add(idx)
+                tool_meta[idx] = (tid or "", name or "")
+                yield ("tool_start", idx, tid or "", name or "")
+            elif idx in started_tools and (tid or name) and (tid != previous[0] or name != previous[1]):
+                tool_meta[idx] = (tid or previous[0], name or previous[1])
+                yield ("tool_start", idx, tid or "", name or "")
             if args:
                 yield ("tool_delta", idx, args)
         fr = choice.get("finish_reason")

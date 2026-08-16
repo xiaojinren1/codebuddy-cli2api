@@ -1,0 +1,12 @@
+# Merge these entries into ~/.codex/config.toml.
+# Keep the active Codex model native; CodeBuddy is exposed as a consultation tool.
+
+[mcp_servers.codebuddy_consult]
+command = "python3"
+args = ["-m", "codebuddy_gateway.consult_mcp"]
+cwd = "/Users/data/project/codebuddy-cli2api"
+
+[mcp_servers.codebuddy_consult.env]
+CODEBUDDY_GATEWAY_URL = "http://127.0.0.1:8787"
+CODEBUDDY_CONSULT_MODEL = "glm-5.3"
+# CODEBUDDY_GATEWAY_KEY = ""

@@ -23,10 +23,11 @@ from .common import (
     log,
     models_json,
 )
+from . import augment
 from .formats import anthropic, codex, gemini, openai
 from .resources import forward_resource, resolve_resource
 from .rotation import KeyPool
-from .upstream import stream_codebuddy
+from .upstream import stream_codebuddy, extract_usage_from_chunks
 from .auth import SESSIONS
 
 # Methods on the pool that are retryable upstream statuses.
@@ -159,6 +160,170 @@ def _connect(openai_body: dict[str, Any], fmt_name: str):
     raise last_err or UpstreamError(502, "all keys exhausted")
 
 
+# ── capability augmentation (vision + web tools) ──────────────────────────
+def _apply_augmentation(openai_body: dict[str, Any], key: str) -> dict[str, Any]:
+    """Apply vision-description + web-tool injection when enabled.
+
+    Vision uses the *original* key credential (any ck_ key works for the
+    describer call). Web tool injection is pure body rewriting.
+    """
+    if not augment.AUGMENT_ENABLED:
+        return openai_body
+    body = openai_body
+    try:
+        body = augment.inject_vision_descriptions(body, key)
+    except GatewayError as e:
+        # Vision describer failure must not kill the whole request: fall back
+        # to the unaugmented body (the main model will just not see images).
+        log.warning("augment: vision describe failed, passing through: %s", e.message)
+    try:
+        body = augment.inject_web_tools(body)
+    except Exception as e:  # noqa: BLE001
+        log.warning("augment: web tool injection failed: %s", e)
+    return body
+
+
+def _first_tool_call(first_chunk: dict[str, Any] | None, rest: Iterator[dict[str, Any]]):
+    """Consume chunks, return (events_list, tool_calls, finish_reason, usage).
+
+    Aggregates the full response so the virtual-tool loop can inspect complete
+    tool call arguments before deciding whether to execute + replay.
+    """
+    from .upstream import iter_events
+    chunks = [c for c in chain([first_chunk] if first_chunk is not None else [], rest) if c]
+    tool_calls: dict[int, dict[str, Any]] = {}
+    order: list[int] = []
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    finish_reason = None
+    usage = extract_usage_from_chunks(chunks)
+    chunk_id = None
+    created = None
+    model = None
+    for ev in iter_events(iter(chunks)):
+        kind = ev[0]
+        if kind == "meta":
+            _, chunk_id, created, model = ev
+        elif kind == "text":
+            text_parts.append(ev[1])
+        elif kind == "reasoning":
+            reasoning_parts.append(ev[1])
+        elif kind == "tool_start":
+            idx, tid, name = ev[1], ev[2], ev[3]
+            if idx not in tool_calls:
+                tool_calls[idx] = {"id": tid, "type": "function", "function": {"name": name, "arguments": ""}}
+                order.append(idx)
+            else:
+                if tid:
+                    tool_calls[idx]["id"] = tid
+                if name:
+                    tool_calls[idx]["function"]["name"] = name
+        elif kind == "tool_delta":
+            idx, frag = ev[1], ev[2]
+            if idx not in tool_calls:
+                tool_calls[idx] = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+                order.append(idx)
+            tool_calls[idx]["function"]["arguments"] += frag
+        elif kind == "finish":
+            finish_reason = ev[1]
+    calls = [tool_calls[i] for i in order]
+    return {
+        "text": "".join(text_parts),
+        "reasoning": "".join(reasoning_parts),
+        "tool_calls": calls,
+        "finish_reason": finish_reason,
+        "usage": usage,
+        "id": chunk_id,
+        "created": created,
+        "model": model,
+    }
+
+
+def _replay_with_virtual_tools(
+    openai_body: dict[str, Any], key: str, fmt_name: str
+) -> tuple[dict[str, Any] | None, Iterator[dict[str, Any]]]:
+    """Run the virtual-tool loop. Returns (aggregated_result, final_chunk_iter).
+
+    When the model calls a virtual tool (web_search/web_fetch), execute it,
+    append the assistant tool_calls + tool result to the messages, and re-send
+    upstream — up to augment.MAX_LOOPS. The final iteration's chunk iterator
+    is returned for normal streaming/aggregation downstream. If the model
+    never calls a virtual tool, returns (None, original_iterator).
+    """
+    body = openai_body
+    for loop in range(augment.MAX_LOOPS):
+        first, rest, k = _connect(body, fmt_name)
+        agg = _first_tool_call(first, rest)
+        virtual = [tc for tc in agg["tool_calls"]
+                   if augment.is_virtual_tool((tc["function"] or {}).get("name", ""))]
+        real = [tc for tc in agg["tool_calls"] if tc not in virtual]
+        if not virtual:
+            # Nothing to execute: rebuild a chunk iterator from the aggregate
+            # and hand it downstream untouched.
+            return None, _agg_to_chunks(agg)
+
+        log.info("augment: loop %d, executing %d virtual tool call(s)", loop + 1, len(virtual))
+
+        # Append the assistant message with ALL tool_calls (virtual + real) so
+        # the model sees its own reasoning context, then a tool result message
+        # per call. Virtual results are real; real tools get a deferral notice
+        # (the client will execute them after this stream ends).
+        assistant_msg: dict[str, Any] = {"role": "assistant", "content": agg["text"] or None}
+        if agg["tool_calls"]:
+            assistant_msg["tool_calls"] = [
+                {"id": tc["id"] or f"call_v{loop}_{i}", "type": "function",
+                 "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"] or "{}"}}
+                for i, tc in enumerate(agg["tool_calls"])
+            ]
+        messages = list(body.get("messages", [])) + [assistant_msg]
+        for i, tc in enumerate(agg["tool_calls"]):
+            name = (tc["function"] or {}).get("name", "")
+            try:
+                arguments = json.loads(tc["function"].get("arguments") or "{}")
+            except json.JSONDecodeError:
+                arguments = {}
+            if augment.is_virtual_tool(name):
+                result_text = augment.execute_virtual_tool(name, arguments, key)
+            else:
+                result_text = (
+                    "(该工具由客户端执行，本轮不可用；请基于已有信息继续，"
+                    "或先使用 web_search/web_fetch 获取信息)"
+                )
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc["id"] or f"call_v{loop}_{i}",
+                "content": result_text,
+            })
+        body = dict(body)
+        body["messages"] = messages
+
+    # Loops exhausted: one last upstream call, results as-is.
+    first, rest, k = _connect(body, fmt_name)
+    return None, chain([first] if first is not None else [], rest)
+
+
+def _agg_to_chunks(agg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Rebuild raw OpenAI chunks from an aggregate (for passthrough)."""
+    chunks: list[dict[str, Any]] = []
+    if agg.get("id") is not None or True:
+        chunks.append({"id": agg.get("id"), "created": agg.get("created"), "model": agg.get("model"),
+                       "choices": [{"index": 0, "delta": {}, "finish_reason": None}]})
+    if agg.get("reasoning"):
+        chunks.append({"choices": [{"index": 0, "delta": {"reasoning_content": agg["reasoning"]}, "finish_reason": None}]})
+    if agg.get("text"):
+        chunks.append({"choices": [{"index": 0, "delta": {"content": agg["text"]}, "finish_reason": None}]})
+    for i, tc in enumerate(agg.get("tool_calls") or []):
+        fn = tc.get("function") or {}
+        chunks.append({"choices": [{"index": 0, "delta": {"tool_calls": [{
+            "index": i, "id": tc.get("id") or "", "type": "function",
+            "function": {"name": fn.get("name", ""), "arguments": fn.get("arguments", "")},
+        }]}, "finish_reason": None}]})
+    chunks.append({"choices": [{"index": 0, "delta": {}, "finish_reason": agg.get("finish_reason") or "stop"}]})
+    if agg.get("usage"):
+        chunks.append({"choices": [], "usage": agg["usage"]})
+    return chunks
+
+
 # ── request handler ─────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     server_version = "codebuddy-gateway/1.0"
@@ -282,9 +447,27 @@ class Handler(BaseHTTPRequestHandler):
 
         client_stream = bool(openai_body.get("stream", stream_hint))
 
+        # ── Capability augmentation (vision descriptions + web tools) ──
+        augmented = False
+        if augment.AUGMENT_ENABLED:
+            try:
+                probe_key = _pool.peek() or ""
+            except Exception:  # noqa: BLE001
+                probe_key = ""
+            if probe_key:
+                openai_body = _apply_augmentation(openai_body, probe_key)
+                augmented = True
+
         # Connect upstream (with multi-key retry before any bytes are sent).
         try:
-            first, rest, key = _connect(openai_body, fmt_name)
+            replayed = None
+            if augmented and openai_body.get("tools"):
+                replayed, chunk_iter = _replay_with_virtual_tools(openai_body, _pool.peek() or "", fmt_name)
+                first = None
+                rest = chunk_iter
+                key = "augmented"
+            else:
+                first, rest, key = _connect(openai_body, fmt_name)
         except UpstreamError as e:
             msg = "upstream error"
             if isinstance(e.body, dict):
@@ -296,7 +479,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         chunks = chain([first], rest) if first is not None else rest
-        tee = _UsageTee(chunks, key)
+        tee = _UsageTee(chunks, key if isinstance(key, str) else "augment")
 
         if client_stream:
             try:

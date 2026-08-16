@@ -128,6 +128,15 @@ class KeyPool:
     def size(self) -> int:
         return len(self._keys)
 
+    def peek(self) -> str | None:
+        """Any currently-available key (for auxiliary calls, no rotation)."""
+        import time as _time
+        now = _time.time()
+        for ks in self._keys:
+            if ks.available(now):
+                return ks.key
+        return self._keys[0].key if self._keys else None
+
     def has_keys(self) -> bool:
         return bool(self._keys)
 
