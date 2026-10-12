@@ -17,11 +17,30 @@
             "off": "none",
             "minimal": "low",
             "low": "low",
-            "medium": "high",
+            "medium": "medium",
             "high": "high",
-            "xhigh": "high",
-            "max": "high"
-          }
+            "xhigh": "max",
+            "max": "max"
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 128000
+        },
+        {
+          "id": "glm-5.3-flash",
+          "name": "GLM 5.3 Flash",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "max",
+            "max": "max"
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 128000
         },
         {
           "id": "glm-5.2",
@@ -35,7 +54,9 @@
             "high": "high",
             "xhigh": "high",
             "max": "high"
-          }
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 128000
         },
         {
           "id": "deepseek-v4-pro",
@@ -45,11 +66,13 @@
             "off": "none",
             "minimal": "low",
             "low": "low",
-            "medium": "high",
+            "medium": "medium",
             "high": "high",
-            "xhigh": "high",
-            "max": "high"
-          }
+            "xhigh": "max",
+            "max": "max"
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 393216
         },
         {
           "id": "deepseek-v4-flash",
@@ -59,11 +82,13 @@
             "off": "none",
             "minimal": "low",
             "low": "low",
-            "medium": "high",
+            "medium": "medium",
             "high": "high",
-            "xhigh": "high",
-            "max": "high"
-          }
+            "xhigh": "max",
+            "max": "max"
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 393216
         },
         {
           "id": "kimi-k3-2",
@@ -71,7 +96,9 @@
           "reasoning": false,
           "samplingParams": {
             "reasoning_effort": "none"
-          }
+          },
+          "contextWindow": 1000000,
+          "maxTokens": 131072
         }
       ]
     }

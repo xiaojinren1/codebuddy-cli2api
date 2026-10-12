@@ -22,7 +22,10 @@ from .common import (
     UpstreamError,
     log,
     models_json,
+    is_quota_exhausted,
+    upstream_message,
 )
+
 from . import augment
 from .formats import anthropic, codex, gemini, openai
 from .resources import forward_resource, resolve_resource
@@ -137,13 +140,20 @@ def _connect(openai_body: dict[str, Any], fmt_name: str):
             first = next(gen, None)
             return first, gen, key
         except UpstreamError as e:
-            _pool.mark_error(key, e.status)
             last_err = e
+            # Credit pool empty: another key on the same account, a backoff, or
+            # the OAuth fallback all hit the same wall - fail fast and say why.
+            if is_quota_exhausted(e.body):
+                log.warning("upstream quota exhausted: %s", upstream_message(e.body))
+                retryable_only = False
+                break
+            _pool.mark_error(key, e.status)
             if e.status not in _RETRYABLE:
                 retryable_only = False
                 break
             log.info("upstream %d on key …%s, retrying another key", e.status, key[-6:])
             continue
+
 
     if retryable_only:
         try:
@@ -469,10 +479,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 first, rest, key = _connect(openai_body, fmt_name)
         except UpstreamError as e:
-            msg = "upstream error"
-            if isinstance(e.body, dict):
-                msg = str(e.body.get("msg") or e.body.get("message") or msg)
+            msg = upstream_message(e.body)
             self._send_error(e.status, f"CodeBuddy: {msg} (HTTP {e.status})", fmt_name)
+
             return
         except GatewayError as e:
             self._send_error(e.status, e.message, fmt_name)
@@ -505,10 +514,9 @@ class Handler(BaseHTTPRequestHandler):
                 result = fmt.emit_nonstream(tee, model=openai_body.get("model"))
                 self._send_json(200, result)
             except UpstreamError as e:
-                msg = "upstream error"
-                if isinstance(e.body, dict):
-                    msg = str(e.body.get("msg") or e.body.get("message") or msg)
+                msg = upstream_message(e.body)
                 self._send_error(e.status, f"CodeBuddy: {msg} (HTTP {e.status})", fmt_name)
+
             except Exception as e:  # noqa: BLE001
                 log.exception("emit_nonstream failed")
                 self._send_error(502, f"gateway error: {e}", fmt_name)

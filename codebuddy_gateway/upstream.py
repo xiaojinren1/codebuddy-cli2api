@@ -23,6 +23,117 @@ from .common import (
     log,
     upstream_headers,
 )
+from . import sanitize
+
+
+def _read_error_body(reader) -> Any:
+    raw = b""
+    try:
+        raw = reader.read()
+    except Exception:
+        pass
+    if not raw:
+        return None
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return raw.decode("utf-8", "replace")[:500]
+
+
+def _open_upstream(url: str, body: dict[str, Any], api_key: str, mode: str):
+    """POST ``body`` to ``url``; return the open response or raise UpstreamError."""
+    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    headers = upstream_headers(api_key, mode=mode)
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    log.debug("-> CodeBuddy %s model=%s msgs=%d", url, body.get("model"), len(body.get("messages", [])))
+    try:
+        resp = urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT)
+    except urllib.error.HTTPError as e:
+        raise UpstreamError(e.code, f"CodeBuddy HTTP {e.code}", _read_error_body(e))
+    except urllib.error.URLError as e:
+        raise UpstreamError(502, f"CodeBuddy connection error: {e}")
+    status = resp.status
+    if status < 200 or status >= 300:
+        raise UpstreamError(status, f"CodeBuddy HTTP {status}", _read_error_body(resp))
+    return resp
+
+
+def _probe_blocked(url: str, text: str, model: str | None, api_key: str, mode: str) -> bool:
+    """Send ``text`` as a 1-token probe; True when upstream blocks it."""
+    probe = {
+        "model": model or "glm-5.3",
+        "messages": [{"role": "system", "content": text}, {"role": "user", "content": "hi"}],
+        "stream": True,
+        "max_tokens": 1,
+    }
+    try:
+        resp = _open_upstream(url, probe, api_key, mode)
+    except UpstreamError as e:
+        return sanitize.is_block_error(e.status, e.body)
+    try:
+        resp.close()
+    except Exception:
+        pass
+    return False
+
+
+_REASONING_OFF = {"off", "false", "none", "no", "minimal", "0", ""}
+_REASONING_ON = {"low", "medium", "high", "max", "ultra", "xhigh"}
+
+
+def _canonical_effort(token: str) -> str:
+    """Map a known effort token onto the value we send upstream."""
+    if token in _REASONING_OFF:
+        return "low"
+    if token in ("xhigh", "ultra"):
+        return "max"
+    return token
+
+
+def apply_reasoning_effort(body: dict[str, Any]) -> dict[str, Any]:
+    """Normalize ``reasoning_effort`` in place. Returns the same dict.
+
+    Client omit  → ``max``. glm-5.3 thinks deeply with the field absent, but
+                   deepseek-v4-* emit *no* CoT unless an effort is present, so a
+                   value must be injected. ``max`` is accepted by every model we
+                   probed, including non-reasoning ones (hy3 / hunyuan / auto).
+    off/none/low → ``low`` (only way to disable CoT).
+    medium/high  → passthrough (light CoT).
+    max/xhigh    → ``max`` (deep CoT).
+    Env ``CODEBUDDY_REASONING_EFFORT`` overrides the injected default; set it to
+    an empty string to send no field at all.
+
+    """
+    explicit = body.get("reasoning_effort")
+    if "reasoning_effort" in body and explicit is None:
+        raise GatewayError(400, "reasoning_effort must be a string")
+
+    token: str | None = None
+    if explicit is not None:
+        if isinstance(explicit, bool):
+            token = "high" if explicit else "none"
+        elif not isinstance(explicit, str):
+            raise GatewayError(400, "reasoning_effort must be a string")
+        else:
+            token = explicit.strip().lower()
+        if token not in _REASONING_OFF | _REASONING_ON:
+            raise GatewayError(400, f"unsupported reasoning_effort: {body.get('reasoning_effort')}")
+    elif body.get("enable_thinking") is False or body.get("reasoning") is False:
+        token = "none"
+    else:
+        env_effort = os.environ.get("CODEBUDDY_REASONING_EFFORT", "max").strip().lower()
+        if env_effort:
+            if env_effort not in _REASONING_OFF | _REASONING_ON:
+                raise GatewayError(400, f"unsupported CODEBUDDY_REASONING_EFFORT: {env_effort}")
+            token = env_effort
+
+    if token is None:
+        body.pop("reasoning_effort", None)
+    else:
+        body["reasoning_effort"] = _canonical_effort(token)
+    return body
+
+
 
 
 def stream_codebuddy(
@@ -47,76 +158,40 @@ def stream_codebuddy(
     else:
         body["stream_options"] = {"include_usage": True}
 
-    # ── Reasoning / chain-of-thought injection ─────────────────────────────
-    # CodeBuddy only emits ``reasoning_content`` when the request carries a
-    # top-level ``reasoning_effort`` string ("low" | "high"). Most OpenAI-style
-    # clients (incl. Hermes' OpenAI transport, which gates reasoning on a
-    # host allowlist that excludes the local gateway) never send it, so the
-    # thinking chain silently disappears. Inject a default unless the client
-    # already asked for something or explicitly disabled reasoning.
-    # Env override: CODEBUDDY_REASONING_EFFORT (off|false|"" to disable).
-    _reasoning_off = {"off", "false", "none", "no", "minimal", "0", ""}
-    env_effort = os.environ.get("CODEBUDDY_REASONING_EFFORT", "high").strip().lower()
-    explicit_effort = body.get("reasoning_effort")
-    explicit_effort_disabled = False
-    if "reasoning_effort" in body and explicit_effort is None:
-        raise GatewayError(400, "reasoning_effort must be a string")
-    if explicit_effort is not None:
-        if isinstance(explicit_effort, bool):
-            explicit_effort = "high" if explicit_effort else "none"
-        elif not isinstance(explicit_effort, str):
-            raise GatewayError(400, "reasoning_effort must be a string")
-        else:
-            explicit_effort = explicit_effort.strip().lower()
-        if explicit_effort not in _reasoning_off | {"low", "high"}:
-            raise GatewayError(400, f"unsupported reasoning_effort: {body.get('reasoning_effort')}")
-        if explicit_effort in _reasoning_off:
-            explicit_effort_disabled = True
-            body.pop("reasoning_effort", None)
-        else:
-            body["reasoning_effort"] = explicit_effort
-    explicit_disable = (
-        body.get("enable_thinking") is False
-        or body.get("reasoning") is False
-        or body.get("reasoning_effort") in (False, 0, "off", "false", "none", "no", "")
-        or explicit_effort_disabled
-    )
-    if env_effort not in _reasoning_off | {"low", "high"}:
-        raise GatewayError(400, f"unsupported CODEBUDDY_REASONING_EFFORT: {env_effort}")
-    if "reasoning_effort" not in body and not explicit_disable and env_effort not in _reasoning_off:
-        body["reasoning_effort"] = env_effort
+    # ── Reasoning / chain-of-thought ───────────────────────────────────────
+    # Measured against the live upstream 2026-09-08 — the two families disagree,
+    # so a single "just omit it" rule cannot work:
+    #   glm-5.3 / glm-5.3-flash : omit or max/xhigh → deep, medium/high → light, low → off
+    #   deepseek-v4-pro/flash   : omit → NO CoT at all, any effort value → CoT
+    # Injecting ``max`` when the client sends nothing satisfies both, and every
+    # non-reasoning model we probed (hy3 / hunyuan / kimi / auto) accepts it.
+    # Passthrough known values, alias xhigh/ultra → max, map disables to ``low``.
+    # CODEBUDDY_REASONING_EFFORT overrides the default ("" = send no field).
+    apply_reasoning_effort(body)
+
 
     url = (base_url or DEFAULT_BASE_URL).rstrip("/") + DEFAULT_CHAT_PATH
-    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    headers = upstream_headers(api_key, mode=mode)
 
-    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-    log.debug("-> CodeBuddy %s model=%s msgs=%d", url, body.get("model"), len(body.get("messages", [])))
-
+    # ── Prompt-fingerprint block (400 code 11128) ───────────────────────────
+    # CodeBuddy blocks verbatim system prompts of other coding agents. Break
+    # known literals up front; on an unknown one, learn it (bisect probes) and
+    # retry once. See sanitize.py.
+    body = sanitize.neutralize_body(body)
     try:
-        resp = urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT)
-    except urllib.error.HTTPError as e:
-        raw = b""
-        try:
-            raw = e.read()
-        except Exception:
-            pass
-        try:
-            err_body = json.loads(raw.decode("utf-8")) if raw else None
-        except Exception:
-            err_body = raw.decode("utf-8", "replace")[:500] if raw else None
-        raise UpstreamError(e.code, f"CodeBuddy HTTP {e.code}", err_body)
-    except urllib.error.URLError as e:
-        raise UpstreamError(502, f"CodeBuddy connection error: {e}")
+        resp = _open_upstream(url, body, api_key, mode)
+    except UpstreamError as e:
+        if not (sanitize.learning_enabled() and sanitize.is_block_error(e.status, e.body)):
+            raise
+        learned = sanitize.learn_blocked_literal(
+            body, lambda text: _probe_blocked(url, text, body.get("model"), api_key, mode))
+        if not learned:
+            raise
+        retry_body = sanitize.neutralize_body(body)
+        if retry_body is body:
+            raise
+        log.info("sanitize: retrying after neutralizing the blocked literal")
+        resp = _open_upstream(url, retry_body, api_key, mode)
 
-    status = resp.status
-    if status < 200 or status >= 300:
-        raw = resp.read()
-        try:
-            err_body = json.loads(raw.decode("utf-8")) if raw else None
-        except Exception:
-            err_body = raw.decode("utf-8", "replace")[:500] if raw else None
-        raise UpstreamError(status, f"CodeBuddy HTTP {status}", err_body)
 
     try:
         for raw_line in resp:

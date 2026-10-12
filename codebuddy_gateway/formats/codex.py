@@ -30,11 +30,18 @@ _COMPACT_INSTRUCTIONS = (
 )
 
 _DISABLED_REASONING = {"none", "minimal", "off", "false", "no", "0", ""}
-_REASONING_ALIASES = {"low": "low", "medium": "high", "high": "high", "xhigh": "high", "max": "high", "ultra": "high"}
+_REASONING_ALIASES = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+    "ultra": "max",
+}
 
 
 def map_reasoning_effort(value: Any) -> str:
-    """Map Codex effort names to CodeBuddy's only supported values."""
+    """Map Codex effort names onto values CodeBuddy actually honors."""
     if isinstance(value, bool):
         return "high" if value else "none"
     if value is None:

@@ -13,15 +13,17 @@ class ReasoningMappingTests(unittest.TestCase):
     def test_effort_mapping(self):
         for value in ("low",):
             self.assertEqual(map_reasoning_effort(value), "low")
-        for value in ("medium", "high", "xhigh", "max", "ultra"):
-            self.assertEqual(map_reasoning_effort(value), "high")
+        self.assertEqual(map_reasoning_effort("medium"), "medium")
+        self.assertEqual(map_reasoning_effort("high"), "high")
+        for value in ("xhigh", "max", "ultra"):
+            self.assertEqual(map_reasoning_effort(value), "max")
         for value in ("none", "minimal", "off"):
             self.assertEqual(map_reasoning_effort(value), "none")
         with self.assertRaises(GatewayError):
             map_reasoning_effort("unsupported")
 
     def test_nested_and_top_level_effort(self):
-        self.assertEqual(parse({"input": "x", "reasoning": {"effort": "xhigh"}}, {}, "")["reasoning_effort"], "high")
+        self.assertEqual(parse({"input": "x", "reasoning": {"effort": "xhigh"}}, {}, "")["reasoning_effort"], "max")
         self.assertEqual(parse({"input": "x", "reasoning_effort": "low"}, {}, "")["reasoning_effort"], "low")
         self.assertEqual(parse({"input": "x", "reasoning": {"effort": "off"}}, {}, "")["reasoning_effort"], "none")
         with self.assertRaises(GatewayError):

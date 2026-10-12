@@ -1,12 +1,12 @@
-"""Capability augmentation for non-vision reasoning models (e.g. glm-5.3).
+"""Capability augmentation for models that lack vision or web access.
 
 Two transparent upgrades, applied when the requested model lacks them:
 
 1. **Vision** — if the incoming messages contain images and the target model
    has no vision (``img=False`` in the catalog), every image is described by
-   a vision model (default ``kimi-k3-2``, works with plain ``ck_`` keys) and
-   the description text is injected in place of the image. The main model
-   stays in charge of reasoning; it just "sees" through the vision model.
+   a vision model (default ``kimi-k3-2``) and the description text is injected
+   in place of the image. ``glm-5.3`` is excluded: it is text-only; use
+   ``glm-5.3-flash`` for native multimodal.
 
 2. **Web access** — two virtual tools (``web_search`` / ``web_fetch``) are
    appended to the request's ``tools``. When the main model calls them, the
@@ -112,6 +112,9 @@ def _capabilities() -> dict[str, dict[str, Any]]:
     return _model_capabilities
 
 
+_NO_VISION_PROXY = {"glm-5.3"}  # text-only; native vision lives on glm-5.3-flash
+
+
 def model_has_vision(model: str) -> bool:
     """True when the model id reports vision support (unknown -> True)."""
     caps = _capabilities().get(model)
@@ -214,7 +217,7 @@ def inject_vision_descriptions(
     process (LRU bounded).
     """
     model = openai_body.get("model", "")
-    if model_has_vision(model):
+    if model in _NO_VISION_PROXY or model_has_vision(model):
         return openai_body
     messages = openai_body.get("messages")
     if not isinstance(messages, list):

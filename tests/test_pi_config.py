@@ -18,12 +18,18 @@ class PiConfigTemplateTests(unittest.TestCase):
                 "off": "none",
                 "minimal": "low",
                 "low": "low",
-                "medium": "high",
+                "medium": "medium",
                 "high": "high",
-                "xhigh": "high",
-                "max": "high",
+                "xhigh": "max",
+                "max": "max",
             },
         )
+        self.assertIn("glm-5.3-flash", models)
+        self.assertIn("image", models["glm-5.3-flash"].get("input") or [])
+        # deepseek honours max upstream; the template must not collapse it to high.
+        for mid in ("deepseek-v4-pro", "deepseek-v4-flash"):
+            self.assertEqual(models[mid]["thinkingLevelMap"]["max"], "max", mid)
+            self.assertEqual(models[mid]["thinkingLevelMap"]["xhigh"], "max", mid)
         self.assertFalse(models["kimi-k3-2"]["reasoning"])
         self.assertEqual(models["kimi-k3-2"]["samplingParams"]["reasoning_effort"], "none")
 

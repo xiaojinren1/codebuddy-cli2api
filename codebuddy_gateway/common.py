@@ -107,7 +107,8 @@ log = logging.getLogger("codebuddy.gateway")
 MODELS: list[dict[str, Any]] = [
     {"id": "hy3-preview-agent", "name": "Hy3 preview",            "img": True,  "max_out": 64000},
     {"id": "glm-5.1",           "name": "GLM-5.1",                 "img": False, "max_out": 48000},
-    {"id": "glm-5.3",           "name": "GLM-5.3",                 "img": False, "max_out": 48000, "reasoning": {"effort": "high"}},
+    {"id": "glm-5.3",           "name": "GLM-5.3",                 "img": False, "max_out": 48000, "reasoning": {"effort": "max"}},
+    {"id": "glm-5.3-flash",     "name": "GLM-5.3-Flash",           "img": True,  "max_out": 48000, "reasoning": {"effort": "max"}},
     {"id": "glm-5.2",           "name": "GLM-5.2",                 "img": False, "max_out": 48000, "reasoning": {"effort": "high"}},
     {"id": "glm-5.0",           "name": "GLM-5.0",                 "img": False, "max_out": 48000},
     {"id": "glm-5.0-turbo",     "name": "GLM-5.0-Turbo",           "img": False, "max_out": 48000},
@@ -299,6 +300,21 @@ def _local_storage_models() -> list[dict[str, Any]] | None:
     return candidates[0][1]
 
 
+_CATALOG_EXTRAS: list[dict[str, Any]] = [
+    # Live CLI catalog lags behind; keep flash visible even when local_storage
+    # has not picked it up yet. Skip if the live list already has the id.
+    {"id": "glm-5.3-flash", "name": "GLM-5.3-Flash", "img": True, "max_out": 48000,
+     "reasoning": {"effort": "max"}},
+]
+
+
+def _merge_catalog_extras(cat: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ids = {m.get("id") for m in cat}
+    extra = [dict(m) for m in _CATALOG_EXTRAS if m["id"] not in ids]
+    return cat + extra if extra else cat
+
+
+
 _CATALOG: dict[str, Any] = {"data": None, "ts": 0.0}
 _CATALOG_TTL = float(os.environ.get("CODEBUDDY_MODELS_TTL", "3600"))
 
@@ -328,6 +344,7 @@ def load_model_catalog() -> list[dict[str, Any]]:
         cat = _cli_product_models()     # generic CLI default (fallback)
     if not cat:
         cat = MODELS                    # hardcoded last resort
+    cat = _merge_catalog_extras(cat or [])
     _CATALOG["data"] = cat
     _CATALOG["ts"] = now
     log.info("model catalog resolved: %d models", len(cat))
@@ -357,11 +374,12 @@ def models_json() -> dict[str, Any]:
 
 
 _CODEX_REASONING_LEVELS = {
-    # Codex exposes Low/Medium/High/X-High. CodeBuddy's Medium/High/X-High
-    # choices are all represented upstream by its supported ``high`` value.
-    "deepseek-v4-pro": (["low", "medium", "high", "xhigh"], "high"),
+    # Codex picker labels. Wire values are mapped in formats/codex.py
+    # (xhigh → max). Defaults match the deepest useful CoT for each model.
+    "deepseek-v4-pro": (["low", "medium", "high", "xhigh"], "xhigh"),
     "deepseek-v4-flash": (["low", "medium", "high", "xhigh"], "xhigh"),
-    "glm-5.3": (["low", "medium", "high", "xhigh"], "high"),
+    "glm-5.3": (["low", "medium", "high", "xhigh"], "xhigh"),
+    "glm-5.3-flash": (["low", "medium", "high", "xhigh"], "xhigh"),
     "glm-5.2": (["medium", "high", "xhigh"], "high"),
 }
 _CODEX_NO_REASONING_MENU = {"kimi-k3-2", "glm-5v-turbo"}
@@ -510,6 +528,54 @@ class GatewayError(Exception):
 
 class UpstreamError(GatewayError):
     """Non-2xx from CodeBuddy."""
+
+
+
+# ── Upstream error introspection ────────────────────────────────────────────
+# CodeBuddy nests its reason differently per failure class:
+#   blocklist  {"code":11128,"msg":...}
+#   quota      {"error":{"data":{"code":14014,"msg":"企业总额度已全部用尽…"}}}
+# so pull the message from any of the shapes instead of showing "upstream error".
+_QUOTA_CODES = {14014}
+_QUOTA_MARKERS = ("额度已全部用尽", "额度已用尽", "quota", "购买加量包")
+
+
+def _err_nodes(body: Any) -> list[dict[str, Any]]:
+    """Every dict worth inspecting in an upstream error body (outer first)."""
+    nodes: list[dict[str, Any]] = []
+    stack = [body]
+    while stack:
+        node = stack.pop(0)
+        if isinstance(node, dict):
+            nodes.append(node)
+            stack.extend(v for k, v in node.items() if k in ("error", "data") and isinstance(v, dict))
+    return nodes
+
+
+def upstream_message(body: Any, default: str = "upstream error") -> str:
+    """Human-readable reason from an upstream error body, at any nesting depth."""
+    for node in _err_nodes(body):
+        for key in ("msg", "message", "displayMsg"):
+            value = node.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, dict):  # displayMsg: {"en": ..., "zh": ...}
+                for lang in ("zh", "zh-CN", "en"):
+                    text = value.get(lang)
+                    if isinstance(text, str) and text.strip():
+                        return text.strip()
+    if isinstance(body, str) and body.strip():
+        return body.strip()[:200]
+    return default
+
+
+def is_quota_exhausted(body: Any) -> bool:
+    """True when the account/enterprise credit pool is empty (retrying is futile)."""
+    for node in _err_nodes(body):
+        if node.get("code") in _QUOTA_CODES:
+            return True
+    text = upstream_message(body, default="")
+    return any(marker in text for marker in _QUOTA_MARKERS)
 
 
 # ── Small helpers ───────────────────────────────────────────────────────────
