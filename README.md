@@ -43,6 +43,11 @@ per-account prompt cache.
 - **Hermes Agent plugin** — a drop-in `ProviderProfile` that routes Hermes
   through the gateway. No core modifications.
 
+- **Hot-reloadable model catalog** — models the upstream accepts but the CLI's
+  cached catalog has not learned about yet can be added by editing
+  [`models.extra.json`](models.extra.json); the next request picks them up with
+  no restart. See [docs/adding-models.md](docs/adding-models.md).
+
 ---
 
 ## 🏗️ Architecture
@@ -115,6 +120,8 @@ codebuddy_gateway/                      # the universal gateway (stdlib only)
 plugins/model-providers/codebuddy/      # Hermes Agent provider plugin
   __init__.py      # CodeBuddyProfile(ProviderProfile)
   plugin.yaml      # plugin manifest
+models.extra.json                       # hand-maintained model supplement (see docs/)
+docs/adding-models.md                   # how to add a newly released model
 requirements.txt  .env.example  README.md  LICENSE
 ```
 
@@ -386,6 +393,8 @@ environment; explicit exports therefore take precedence.
 | `CODEBUDDY_CODEX_INSTRUCTIONS_MODE` | `compact` | Upstream Codex system prompt mode: `compact` avoids content filtering, `full` preserves the raw prompt for diagnostics, `drop` omits it. |
 | `CODEBUDDY_REASONING_EFFORT` | `high` | Default CodeBuddy reasoning effort when a client omits one: `low`, `high`, or `none`/`off`/`minimal` to disable. Invalid values fail with HTTP 400. |
 | `CODEBUDDY_MODEL_CATALOG_JSON` | — | Optional gateway-side catalog override (JSON or file path). Codex does not infer capabilities from `/v1/models`; generate a file with `--print-codex-models` and set Codex's `model_catalog_json` in `~/.codex/config.toml`. |
+| `CODEBUDDY_MODELS_EXTRA_FILE` | `./models.extra.json` | Hand-maintained model supplement. Models routable upstream but missing from the CLI catalog go here; editing the file invalidates the catalog cache immediately, so no restart is needed. Set to an empty value to disable the layer. See [docs/adding-models.md](docs/adding-models.md). |
+| `CODEBUDDY_MODELS_URL` | — | Explicit remote model catalog JSON. Highest precedence, above the CLI's own catalog. |
 | `CODEBUDDY_TIMEOUT` | `180` | Upstream request timeout (seconds). |
 | `IMAGE_FETCH_MAX_BYTES` | `20971520` | Cap when inlining a remote image. |
 | `GATEWAY_LOG_LEVEL` | `INFO` | Logging level. |
@@ -463,6 +472,13 @@ curl http://127.0.0.1:8787/health -H "Authorization: Bearer <随机串>"
   gateway; it aggregates non-stream calls transparently.
 - **`no CodeBuddy API keys configured`** — set `CODEBUDDY_API_KEY` (or
   `CODEBUDDY_API_KEYS` / `CODEBUDDY_KEYS_FILE`) before starting the gateway.
+- **A model the upstream supports is missing from `/v1/models`** — the CLI's
+  cached catalog lags behind the service. Confirm the slug is routable, then add
+  it to `models.extra.json` and save; no restart needed. Full procedure:
+  [docs/adding-models.md](docs/adding-models.md).
+- **Empty `content` from a reasoning model** — `max_tokens` was too small; the
+  model spent the whole budget thinking and the answer is in
+  `reasoning_content`. Raise `max_tokens` (≥ 2000).
 
 ---
 
