@@ -129,6 +129,13 @@ MODELS: list[dict[str, Any]] = [
     {"id": "hunyuan-chat",      "name": "Hunyuan-Turbos",          "img": False, "max_out": 8192},
     {"id": "auto",              "name": "Auto",                    "img": True,  "max_out": 32000},
     {"id": "default",           "name": "Default",                 "img": False, "max_out": 24000},
+    # Models routable upstream but absent from the CLI's own catalog. Kept here
+    # as the last-resort fallback so an offline/broken catalog still exposes them.
+    {"id": "glm-5.3-flashx",    "name": "GLM-5.3-FlashX",           "img": True,  "max_out": 48000, "reasoning": {"effort": "max"}},
+    {"id": "deepseek-v4.1-flash","name": "DeepSeek-V4.1-Flash",     "img": True,  "max_out": 50000, "reasoning": {"effort": "high"}},
+    {"id": "hy4-preview",       "name": "Hy4 preview",              "img": True,  "max_out": 64000, "reasoning": {"effort": "high"}},
+    {"id": "step-5-preview",    "name": "Step-5-Preview",           "img": False, "max_out": 48000, "reasoning": {"effort": "high"}},
+    {"id": "space-bunny",       "name": "Space-Bunny",              "img": True,  "max_out": 48000, "reasoning": {"effort": "max"}},
 ]
 
 MODEL_IDS = {m["id"] for m in MODELS}
@@ -300,30 +307,147 @@ def _local_storage_models() -> list[dict[str, Any]] | None:
     return candidates[0][1]
 
 
+def _extra_catalog_file() -> str | None:
+    """Path of the hand-maintained model supplement, or None when unset.
+
+    Defaults to ``models.extra.json`` next to the package so a checkout works
+    with no configuration. Set ``CODEBUDDY_MODELS_EXTRA_FILE`` to relocate it
+    (``""`` disables the file entirely).
+    """
+    override = os.environ.get("CODEBUDDY_MODELS_EXTRA_FILE")
+    if override is not None:
+        override = override.strip()
+        if not override:
+            return None
+        return os.path.expanduser(override)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir,
+                        "models.extra.json")
+
+
+def _extra_catalog_models() -> list[dict[str, Any]] | None:
+    """Read the supplement file: models routable upstream but missing from the
+    CLI's own catalog.
+
+    This is the mechanism that makes a newly released model appear without
+    touching Python: append one object to the JSON file and the next catalog
+    resolve picks it up. ``_norm_model`` accepts the friendly field names
+    (``supports_vision``, ``max_output_tokens``, ``reasoning``), so entries can
+    be written in the same shape the upstream catalog uses.
+
+    Returns None when the file is absent or unreadable so the caller can fall
+    back; a malformed entry is skipped rather than aborting the whole catalog.
+    """
+    path = _extra_catalog_file()
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as e:
+        log.warning("model supplement unreadable (%s): %s", path, e)
+        return None
+
+    if isinstance(data, dict):
+        arr = data.get("models") if isinstance(data.get("models"), list) else None
+        if arr is None and isinstance(data.get("data"), dict):
+            inner = data["data"].get("models")
+            arr = inner if isinstance(inner, list) else None
+    elif isinstance(data, list):
+        arr = data
+    else:
+        arr = None
+    if not isinstance(arr, list):
+        log.warning("model supplement has no models array (%s)", path)
+        return None
+
+    out: list[dict[str, Any]] = []
+    for i, item in enumerate(arr):
+        if not isinstance(item, dict):
+            log.warning("model supplement entry %d is not an object (%s)", i, path)
+            continue
+        norm = _norm_model(item)
+        if norm:
+            out.append(norm)
+        else:
+            log.warning("model supplement entry %d has no usable id (%s)", i, path)
+    return out or None
+
+
 _CATALOG_EXTRAS: list[dict[str, Any]] = [
-    # Live CLI catalog lags behind; keep flash visible even when local_storage
-    # has not picked it up yet. Skip if the live list already has the id.
+    # Two reasons a model belongs here instead of the bundled MODELS list:
+    #
+    #  (a) The CLI's own catalog lags behind the upstream service. New models
+    #      are routable at /v2/chat/completions long before the CLI ships a
+    #      build that knows about them, so `local_storage` (and therefore the
+    #      live catalog) simply lacks the entry. Verified routable before add.
+    #  (b) A new product line (e.g. 3rd-party stealth models) is exposed by the
+    #      upstream but never appears in the CLI catalog at all.
+    #
+    # Each entry is skipped when the live catalog already carries the same id,
+    # so promoting a model into the CLI later needs no code change here.
+    #
+    # Fields: id (upstream slug, must match the wire value exactly),
+    #         name (display), img (native vision input), max_out (output cap),
+    #         reasoning (Codex/pi effort menu; omit for non-reasoning models).
     {"id": "glm-5.3-flash", "name": "GLM-5.3-Flash", "img": True, "max_out": 48000,
+     "reasoning": {"effort": "max"}},
+    {"id": "glm-5.3-flashx", "name": "GLM-5.3-FlashX", "img": True, "max_out": 48000,
+     "reasoning": {"effort": "max"}},
+    {"id": "deepseek-v4.1-flash", "name": "DeepSeek-V4.1-Flash", "img": True, "max_out": 50000,
+     "reasoning": {"effort": "high"}},
+    {"id": "hy4-preview", "name": "Hy4 preview", "img": True, "max_out": 64000,
+     "reasoning": {"effort": "high"}},
+    {"id": "step-5-preview", "name": "Step-5-Preview", "img": False, "max_out": 48000,
+     "reasoning": {"effort": "high"}},
+    {"id": "space-bunny", "name": "Space-Bunny", "img": True, "max_out": 48000,
      "reasoning": {"effort": "max"}},
 ]
 
 
 def _merge_catalog_extras(cat: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    ids = {m.get("id") for m in cat}
-    extra = [dict(m) for m in _CATALOG_EXTRAS if m["id"] not in ids]
-    return cat + extra if extra else cat
+    """Append supplement entries the live catalog is missing.
+
+    Precedence is live catalog first, then ``models.extra.json``, then the
+    bundled ``_CATALOG_EXTRAS`` constant. Anything already present by id is
+    skipped, so promoting a model into the CLI catalog later needs no cleanup
+    in either supplement layer.
+    """
+    merged = list(cat)
+    seen = {m.get("id") for m in merged}
+    for source in (_extra_catalog_models(), _CATALOG_EXTRAS):
+        for m in source or []:
+            if m.get("id") not in seen:
+                merged.append(dict(m))
+                seen.add(m.get("id"))
+    return merged
 
 
 
-_CATALOG: dict[str, Any] = {"data": None, "ts": 0.0}
+_CATALOG: dict[str, Any] = {"data": None, "ts": 0.0, "extras_mtime": None}
 _CATALOG_TTL = float(os.environ.get("CODEBUDDY_MODELS_TTL", "3600"))
 
 
 def load_model_catalog() -> list[dict[str, Any]]:
-    """Resolve + cache the active chat-model catalog."""
+    """Resolve + cache the active chat-model catalog.
+
+    Cached for ``CODEBUDDY_MODELS_TTL`` seconds, with one exception: when the
+    supplement file's mtime changes the cache is bypassed immediately. That is
+    what lets an operator append a model to ``models.extra.json`` and see it in
+    the next request without restarting the gateway.
+    """
     now = time.time()
-    if _CATALOG["data"] is not None and now - _CATALOG["ts"] < _CATALOG_TTL:
+    extras_mtime = None
+    extras_path = _extra_catalog_file()
+    if extras_path:
+        try:
+            extras_mtime = os.path.getmtime(extras_path)
+        except OSError:
+            extras_mtime = None
+    stale_extras = extras_mtime != _CATALOG["extras_mtime"]
+    if (_CATALOG["data"] is not None and not stale_extras
+            and now - _CATALOG["ts"] < _CATALOG_TTL):
         return _CATALOG["data"]
+    _CATALOG["extras_mtime"] = extras_mtime
     cat: list[dict[str, Any]] | None = None
     url = os.environ.get("CODEBUDDY_MODELS_URL")
     if url:
@@ -380,7 +504,12 @@ _CODEX_REASONING_LEVELS = {
     "deepseek-v4-flash": (["low", "medium", "high", "xhigh"], "xhigh"),
     "glm-5.3": (["low", "medium", "high", "xhigh"], "xhigh"),
     "glm-5.3-flash": (["low", "medium", "high", "xhigh"], "xhigh"),
+    "glm-5.3-flashx": (["low", "medium", "high", "xhigh"], "xhigh"),
     "glm-5.2": (["medium", "high", "xhigh"], "high"),
+    "deepseek-v4.1-flash": (["low", "medium", "high", "xhigh"], "xhigh"),
+    "hy4-preview": (["low", "medium", "high", "xhigh"], "xhigh"),
+    "step-5-preview": (["low", "medium", "high", "xhigh"], "xhigh"),
+    "space-bunny": (["low", "medium", "high", "xhigh"], "xhigh"),
 }
 _CODEX_NO_REASONING_MENU = {"kimi-k3-2", "glm-5v-turbo"}
 

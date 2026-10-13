@@ -1,0 +1,82 @@
+{
+  "_comment": [
+    "Hand-maintained model supplement for the CodeBuddy gateway.",
+    "",
+    "WHY THIS FILE EXISTS",
+    "  The gateway resolves its model list from the CodeBuddy CLI's cached",
+    "  catalog (~/.codebuddy/local_storage). That catalog only moves when the",
+    "  CLI itself is updated, so a model the upstream service already accepts",
+    "  can stay invisible here for weeks. Entries below fill that gap.",
+    "",
+    "HOW TO ADD A MODEL",
+    "  1. Confirm the upstream actually accepts the slug before adding it:",
+    "       curl -s localhost:8787/v1/chat/completions \\",
+    "         -H 'content-type: application/json' \\",
+    "         -d '{\"model\":\"<slug>\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":5}'",
+    "     HTTP 200  -> good, add it below.",
+    "     HTTP 400 with 'model [<slug>] service info not found' -> wrong slug,",
+    "     do not add it.",
+    "  2. Append one object to the \"models\" array below.",
+    "  3. Save. The next request picks it up - no restart, no TTL wait, because",
+    "     the gateway invalidates its cache when this file's mtime changes.",
+    "",
+    "FIELDS",
+    "  id                    upstream wire slug. Must match EXACTLY.",
+    "  name                  display name.",
+    "  supports_vision       true when the model accepts image input.",
+    "  max_output_tokens     output cap. Use 48000 unless you know better.",
+    "  reasoning             omit entirely for non-reasoning models.",
+    "                        {\"effort\": \"max\"} marks it as a reasoning model.",
+    "  description           optional free text shown in listings.",
+    "",
+    "NOTES",
+    "  - Entries whose id already exists in the live catalog are ignored, so a",
+    "    model promoted into the CLI later needs no cleanup here.",
+    "  - 'reasoning.effort' seeds the default; the Codex effort picker menu is",
+    "    still defined by _CODEX_REASONING_LEVELS in codebuddy_gateway/common.py.",
+    ""
+  ],
+
+  "models": [
+    {
+      "id": "glm-5.3-flashx",
+      "name": "GLM-5.3-FlashX",
+      "supports_vision": true,
+      "max_output_tokens": 48000,
+      "reasoning": { "effort": "max" },
+      "description": "GLM-5.3 提速档，同基座，约 200 tokens/s"
+    },
+    {
+      "id": "deepseek-v4.1-flash",
+      "name": "DeepSeek-V4.1-Flash",
+      "supports_vision": true,
+      "max_output_tokens": 50000,
+      "reasoning": { "effort": "high" },
+      "description": "新架构，输入输出不对称，更快更普惠"
+    },
+    {
+      "id": "hy4-preview",
+      "name": "Hy4 preview",
+      "supports_vision": true,
+      "max_output_tokens": 64000,
+      "reasoning": { "effort": "high" },
+      "description": "腾讯混元 Agent 底座，1M 上下文；数学为弱项"
+    },
+    {
+      "id": "step-5-preview",
+      "name": "Step-5-Preview",
+      "supports_vision": false,
+      "max_output_tokens": 48000,
+      "reasoning": { "effort": "high" },
+      "description": "阶跃星辰旗舰基模，纯文本"
+    },
+    {
+      "id": "space-bunny",
+      "name": "Space-Bunny",
+      "supports_vision": true,
+      "max_output_tokens": 48000,
+      "reasoning": { "effort": "max" },
+      "description": "匿名厂商模型，1M 上下文，编程与视觉表现强"
+    }
+  ]
+}
